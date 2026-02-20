@@ -5,3 +5,7 @@
 # Python
 __pycache__/
 *.pyc
+LT*.xml
+LT*.pdf
+
+20*/

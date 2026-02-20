@@ -22,12 +22,14 @@ SERVICER_BIC = "REVOLT21"
 SERVICER_NAME = "Revolut Bank UAB"
 SERVICER_COUNTRY = "LT"
 
-# BkTxCd codes per transaction type
+# BkTxCd codes per transaction type (normalized uppercase keys)
 TX_CODES = {
     "CARD_PAYMENT": "30000301000",
     "TOPUP":        "10000405000",
     "FEE":          "40000605000",
     "TRANSFER":     "20000405000",
+    "CASHBACK":     "10000405000",
+    "CARD_REFUND":  "30000301000",
 }
 
 TX_INFO = {
@@ -35,6 +37,23 @@ TX_INFO = {
     "TOPUP":        "Prijata platba",
     "FEE":          "Poplatok",
     "TRANSFER":     "Odchadzajuca platba",
+    "CASHBACK":     "Vratenie cashback",
+    "CARD_REFUND":  "Vratenie kartovej transakcie",
+}
+
+# Map raw CSV Type values to normalized keys
+TYPE_NORMALIZE = {
+    "CARD_PAYMENT":  "CARD_PAYMENT",
+    "Card Payment":  "CARD_PAYMENT",
+    "TOPUP":         "TOPUP",
+    "Topup":         "TOPUP",
+    "FEE":           "FEE",
+    "Fee":           "FEE",
+    "TRANSFER":      "TRANSFER",
+    "Transfer":      "TRANSFER",
+    "CASHBACK":      "CASHBACK",
+    "CARD_REFUND":   "CARD_REFUND",
+    "Card Refund":   "CARD_REFUND",
 }
 
 
@@ -57,22 +76,84 @@ def fmt_amt(d):
 
 
 def extract_sender_name(description):
-    """Extract sender name from TOPUP description like 'Money added from SOME NAME'."""
-    m = re.match(r"Money added from (.+)", description, re.IGNORECASE)
+    """Extract sender name from TOPUP description like 'Money added from SOME NAME'
+    or 'Payment from SOME NAME'."""
+    m = re.match(r"(?:Money added|Payment) from (.+)", description, re.IGNORECASE)
     if m:
         return m.group(1).strip()
     return description
 
 
+def _normalize_row(row):
+    """Normalize a CSV row to the canonical column names used internally.
+
+    Supports two Revolut CSV formats:
+      Old: Date completed (UTC), Total amount, Amount, Payment currency, ID, Reference,
+           Beneficiary IBAN, Beneficiary BIC, Orig currency, Orig amount, Exchange rate, ...
+      New: Completed Date, Amount, Fee, Currency, State, Balance, ...
+
+    Returns a new dict with canonical keys.
+    """
+    if "Date completed (UTC)" in row:
+        raw_type = row.get("Type", "")
+        row["Type"] = TYPE_NORMALIZE.get(raw_type, raw_type)
+        return row
+
+    # New format -> map to canonical columns
+    norm = {}
+    norm["Type"] = TYPE_NORMALIZE.get(row.get("Type", ""), row.get("Type", ""))
+    norm["Product"] = row.get("Product", "")
+    norm["Description"] = row.get("Description", "")
+    norm["State"] = row.get("State", "")
+    norm["Balance"] = row.get("Balance", "0")
+
+    completed = row.get("Completed Date", "").strip()
+    if completed:
+        norm["Date completed (UTC)"] = completed.split(" ")[0]
+    else:
+        started = row.get("Started Date", "").strip()
+        norm["Date completed (UTC)"] = started.split(" ")[0] if started else ""
+
+    amount = dec(row.get("Amount", "0"))
+    fee = dec(row.get("Fee", "0"))
+    norm["Total amount"] = str(amount + fee)
+    norm["Amount"] = row.get("Amount", "0")
+    norm["Fee"] = row.get("Fee", "0")
+
+    norm["Payment currency"] = row.get("Currency", "EUR")
+
+    norm["ID"] = ""
+    norm["Reference"] = ""
+    norm["Beneficiary IBAN"] = ""
+    norm["Beneficiary BIC"] = ""
+    norm["Orig currency"] = ""
+    norm["Orig amount"] = ""
+    norm["Exchange rate"] = ""
+
+    return norm
+
+
 def read_csv(path):
-    """Read Revolut CSV and return list of row dicts, sorted chronologically (oldest first)."""
+    """Read Revolut CSV and return list of normalized row dicts, sorted chronologically."""
     rows = []
     with open(path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append(row)
-    # CSV is newest-first; reverse to chronological order
-    rows.reverse()
+            if row.get("State", "COMPLETED").strip() != "COMPLETED":
+                continue
+            rows.append(_normalize_row(row))
+
+    is_new_format = all("Completed Date" not in r for r in rows)
+    if rows and not is_new_format:
+        pass
+
+    # Determine sort order: if first row date > last row date, it's newest-first
+    if len(rows) >= 2:
+        first_dt = parse_date(rows[0]["Date completed (UTC)"])
+        last_dt = parse_date(rows[-1]["Date completed (UTC)"])
+        if first_dt > last_dt:
+            rows.reverse()
+
     return rows
 
 
@@ -212,7 +293,7 @@ def _add_entry(stmt, row, seq, iban, owner, addr_line1, addr_line2):
     completed_date = parse_date(row["Date completed (UTC)"])
     tx_type = row["Type"]
     tx_code = TX_CODES.get(tx_type, "99999999999")
-    tx_info = TX_INFO.get(tx_type, tx_type)
+    tx_info = TX_INFO.get(tx_type, tx_type.replace("_", " ").title())
     description = row.get("Description", "").strip()
     reference = row.get("Reference", "").strip()
     tx_id = row.get("ID", "").strip()
@@ -371,6 +452,211 @@ def _add_related_agents(tx_dtls, row, is_credit):
         SubElement(dbtr_fi, "Nm").text = SERVICER_NAME
 
 
+def build_pdf(rows, iban, owner, addr_line1, addr_line2, output_path):
+    """Generate a professional bank statement PDF using reportlab."""
+    from reportlab.lib import colors
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import (
+        SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable,
+    )
+
+    dates = [parse_date(r["Date completed (UTC)"]) for r in rows]
+    first_date = min(dates)
+    last_date = max(dates)
+
+    first_balance_after = dec(rows[0]["Balance"])
+    first_total_amount = dec(rows[0]["Total amount"])
+    opening_balance = first_balance_after - first_total_amount
+    closing_balance = dec(rows[-1]["Balance"])
+
+    total_credit = Decimal("0")
+    total_debit = Decimal("0")
+    count_credit = 0
+    count_debit = 0
+    for r in rows:
+        amt = dec(r["Total amount"])
+        if amt >= 0:
+            total_credit += amt
+            count_credit += 1
+        else:
+            total_debit += abs(amt)
+            count_debit += 1
+
+    doc = SimpleDocTemplate(
+        output_path, pagesize=A4,
+        leftMargin=15 * mm, rightMargin=15 * mm,
+        topMargin=15 * mm, bottomMargin=15 * mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "StatementTitle", parent=styles["Title"],
+        fontSize=16, spaceAfter=2 * mm,
+    )
+    heading_style = ParagraphStyle(
+        "SectionHeading", parent=styles["Heading2"],
+        fontSize=11, spaceBefore=4 * mm, spaceAfter=2 * mm,
+        textColor=colors.HexColor("#333333"),
+    )
+    normal = styles["Normal"]
+    small = ParagraphStyle(
+        "Small", parent=normal, fontSize=7.5, leading=10,
+    )
+    small_bold = ParagraphStyle(
+        "SmallBold", parent=small, fontName="Helvetica-Bold",
+    )
+    small_right = ParagraphStyle(
+        "SmallRight", parent=small, alignment=2,
+    )
+    small_right_bold = ParagraphStyle(
+        "SmallRightBold", parent=small_right, fontName="Helvetica-Bold",
+    )
+
+    elements = []
+
+    # Header
+    elements.append(Paragraph("Revolut Bank UAB", title_style))
+    elements.append(Paragraph("Account Statement (camt.053)", normal))
+    elements.append(Spacer(1, 3 * mm))
+    elements.append(HRFlowable(
+        width="100%", thickness=1, color=colors.HexColor("#333333"),
+    ))
+    elements.append(Spacer(1, 4 * mm))
+
+    # Account info table
+    info_data = [
+        [Paragraph("<b>Account Owner:</b>", small), Paragraph(owner, small)],
+        [Paragraph("<b>IBAN:</b>", small), Paragraph(iban, small)],
+        [Paragraph("<b>Address:</b>", small),
+         Paragraph(f"{addr_line1}, {addr_line2}", small)],
+        [Paragraph("<b>Bank:</b>", small),
+         Paragraph(f"{SERVICER_NAME} (BIC: {SERVICER_BIC})", small)],
+        [Paragraph("<b>Currency:</b>", small), Paragraph("EUR", small)],
+        [Paragraph("<b>Statement Period:</b>", small),
+         Paragraph(f"{first_date.isoformat()} to {last_date.isoformat()}", small)],
+    ]
+    info_table = Table(info_data, colWidths=[35 * mm, 140 * mm])
+    info_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 1),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1),
+    ]))
+    elements.append(info_table)
+    elements.append(Spacer(1, 4 * mm))
+
+    # Balance summary
+    elements.append(Paragraph("Balance Summary", heading_style))
+    bal_data = [
+        [Paragraph("<b>Opening Balance:</b>", small),
+         Paragraph(f"EUR {fmt_amt(opening_balance)}", small_right)],
+        [Paragraph("<b>Total Credits:</b>", small),
+         Paragraph(f"EUR +{fmt_amt(total_credit)}  ({count_credit} transactions)", small_right)],
+        [Paragraph("<b>Total Debits:</b>", small),
+         Paragraph(f"EUR -{fmt_amt(total_debit)}  ({count_debit} transactions)", small_right)],
+        [Paragraph("<b>Closing Balance:</b>", small_bold),
+         Paragraph(f"EUR {fmt_amt(closing_balance)}", small_right_bold)],
+    ]
+    bal_table = Table(bal_data, colWidths=[50 * mm, 125 * mm])
+    bal_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 1.5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 1.5),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.5, colors.black),
+        ("LINEABOVE", (0, 0), (-1, 0), 0.5, colors.HexColor("#CCCCCC")),
+    ]))
+    elements.append(bal_table)
+    elements.append(Spacer(1, 4 * mm))
+
+    # Transaction table
+    elements.append(Paragraph("Transaction Details", heading_style))
+
+    header_style = ParagraphStyle(
+        "TblHeader", parent=small, fontName="Helvetica-Bold",
+        textColor=colors.white,
+    )
+    header_right = ParagraphStyle(
+        "TblHeaderRight", parent=header_style, alignment=2,
+    )
+
+    col_widths = [18 * mm, 20 * mm, 62 * mm, 25 * mm, 25 * mm, 25 * mm]
+    tx_header = [
+        Paragraph("#", header_style),
+        Paragraph("Date", header_style),
+        Paragraph("Description", header_style),
+        Paragraph("Type", header_style),
+        Paragraph("Amount", header_right),
+        Paragraph("Balance", header_right),
+    ]
+    tx_data = [tx_header]
+
+    green = colors.HexColor("#1B7A2B")
+    red = colors.HexColor("#C0392B")
+    row_bg_alt = colors.HexColor("#F7F8FA")
+
+    for idx, r in enumerate(rows, start=1):
+        total_amount = dec(r["Total amount"])
+        is_credit = total_amount >= 0
+        balance = dec(r["Balance"])
+        completed = parse_date(r["Date completed (UTC)"])
+        desc = r.get("Description", "").strip()
+        tx_type = TX_INFO.get(r["Type"], r["Type"].replace("_", " ").title())
+
+        amt_color = green if is_credit else red
+        sign = "+" if is_credit else "-"
+        amt_style = ParagraphStyle(
+            f"amt{idx}", parent=small_right, textColor=amt_color,
+        )
+
+        tx_data.append([
+            Paragraph(str(idx), small),
+            Paragraph(completed.strftime("%d.%m.%Y"), small),
+            Paragraph(desc[:80] if len(desc) > 80 else desc, small),
+            Paragraph(tx_type, small),
+            Paragraph(f"{sign}{fmt_amt(abs(total_amount))}", amt_style),
+            Paragraph(fmt_amt(balance), small_right),
+        ])
+
+    tx_table = Table(tx_data, colWidths=col_widths, repeatRows=1)
+    style_cmds = [
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 3),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 3),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#2C3E50")),
+        ("LINEBELOW", (0, 0), (-1, 0), 0.5, colors.black),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.5, colors.black),
+        ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#DDDDDD")),
+    ]
+    for i in range(2, len(tx_data), 2):
+        style_cmds.append(("BACKGROUND", (0, i), (-1, i), row_bg_alt))
+
+    tx_table.setStyle(TableStyle(style_cmds))
+    elements.append(tx_table)
+
+    # Footer
+    elements.append(Spacer(1, 6 * mm))
+    elements.append(HRFlowable(
+        width="100%", thickness=0.5, color=colors.HexColor("#CCCCCC"),
+    ))
+    elements.append(Spacer(1, 2 * mm))
+    footer_style = ParagraphStyle(
+        "Footer", parent=small,
+        textColor=colors.HexColor("#888888"), alignment=1,
+    )
+    now = datetime.now(timezone.utc)
+    elements.append(Paragraph(
+        f"Generated on {now.strftime('%Y-%m-%d %H:%M UTC')} &bull; "
+        f"{len(rows)} transactions &bull; "
+        f"Revolut Bank UAB &bull; {iban}",
+        footer_style,
+    ))
+
+    doc.build(elements)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert Revolut Business CSV to CSOB camt.053.001.02 XML"
@@ -378,6 +664,10 @@ def main():
     parser.add_argument("--iban", required=True, help="Revolut Business IBAN")
     parser.add_argument("--input", required=True, help="Path to Revolut CSV file")
     parser.add_argument("--output", help="Output XML path (auto-generated if omitted)")
+    parser.add_argument("--pdf", action="store_true",
+                        help="Also generate a PDF bank statement")
+    parser.add_argument("--pdf-only", action="store_true",
+                        help="Generate only the PDF (skip XML)")
     parser.add_argument("--owner", default=DEFAULT_OWNER,
                         help=f"Account owner name (default: {DEFAULT_OWNER})")
     parser.add_argument("--addr-line1", default=DEFAULT_ADDR_LINE1,
@@ -391,25 +681,25 @@ def main():
         print("Error: no transactions found in CSV", file=sys.stderr)
         sys.exit(1)
 
-    tree = build_xml(rows, args.iban, args.owner, args.addr_line1, args.addr_line2)
+    dates = [parse_date(r["Date completed (UTC)"]) for r in rows]
+    first_date = min(dates)
+    last_date = max(dates)
+    base_name = f"{args.iban}_{first_date.strftime('%Y%m%d')}_{last_date.strftime('%Y%m%d')}"
 
-    if args.output:
-        output_path = args.output
-    else:
-        dates = [parse_date(r["Date completed (UTC)"]) for r in rows]
-        first_date = min(dates)
-        last_date = max(dates)
-        output_path = f"{args.iban}_{first_date.strftime('%Y%m%d')}_{last_date.strftime('%Y%m%d')}.xml"
+    if not args.pdf_only:
+        tree = build_xml(rows, args.iban, args.owner, args.addr_line1, args.addr_line2)
+        output_path = args.output if args.output else f"{base_name}.xml"
+        indent(tree, space="  ")
+        with open(output_path, "wb") as f:
+            tree.write(f, encoding="UTF-8", xml_declaration=True)
+        credits = sum(1 for r in rows if dec(r["Total amount"]) >= 0)
+        debits = len(rows) - credits
+        print(f"Converted {len(rows)} transactions ({credits} CRDT, {debits} DBIT) -> {output_path}")
 
-    indent(tree, space="  ")
-
-    with open(output_path, "wb") as f:
-        tree.write(f, encoding="UTF-8", xml_declaration=True)
-
-    # Count summary
-    credits = sum(1 for r in rows if dec(r["Total amount"]) >= 0)
-    debits = len(rows) - credits
-    print(f"Converted {len(rows)} transactions ({credits} CRDT, {debits} DBIT) -> {output_path}")
+    if args.pdf or args.pdf_only:
+        pdf_path = f"{base_name}.pdf"
+        build_pdf(rows, args.iban, args.owner, args.addr_line1, args.addr_line2, pdf_path)
+        print(f"PDF statement generated -> {pdf_path}")
 
 
 if __name__ == "__main__":
